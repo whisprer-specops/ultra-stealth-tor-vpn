@@ -1255,6 +1255,379 @@ Pick your next chunk: privilege drop on both OSes, circuit policy tuning via Con
 
 
 
+Done—Windows binary now has the same Tor control CLI as Linux.
+
+Download:
+torvpn_win_with_service_and_control_cli.zip
+
+New commands (work whether or not the service is running)
+# Change circuits now
+.\target\release\torvpn-win.exe newnym
+
+# Inspect circuits
+.\target\release\torvpn-win.exe circuits
+
+# Quick health snapshot
+.\target\release\torvpn-win.exe health
+
+
+They connect to 127.0.0.1:<control_port> and authenticate via the Tor cookie at:
+
+%LOCALAPPDATA%\torvpn\tor-data\control_auth_cookie
+
+
+(same state dir the service uses).
+
+If you want a one-liner to sanity-check all the plumbing: install service, start it, wait ~20–30s, then run health and circuits. If that’s green, we’re golden.
+
+Next big-ticket item you want: privilege drop and service hardening on Windows, or do we swing back to Linux for per-UID nftables and a built-in leaktest command?
+
+
+
+
+Locked in. I added two chunky upgrades to the Linux build:
+
+Per-UID nftables enforcement
+
+Built-in leaktest command (DNS leak probe + Tor SOCKS connectivity)
+
+Download:
+torvpn_linux_uid_and_leaktest.zip
+
+What changed
+Config: new [security] block
+
+Both profiles/default.toml and profiles/transparent.toml now include:
+
+[security]
+allow_uids = []      # numeric UIDs allowed to egress directly
+tor_user   = "tor"   # resolved to UID and auto-added to allowlist if present
+
+
+If the tor account exists, its UID is granted direct egress so Tor can reach the network while everyone else is forced through TUN/TransPort.
+
+nftables (per-UID)
+
+src/nftables.rs now:
+
+Resolves tor_user → UID (via id -u) and merges with allow_uids
+
+Creates an nftables set: allowed_uids
+
+In output (filter) chain, accepts if meta skuid @allowed_uids
+
+Keeps leak clamps:
+
+In tun2socks mode: only oifname "tun0", loopback, Tor localhost ports are allowed for non-allowed UIDs; UDP/53 dropped
+
+In transparent mode: default-drop; allow loopback + Tor localhost ports; UDP/53 redirected to Tor’s DNSPort in NAT; only allowed_uids can egress clearnet directly
+
+This means: only the Tor daemon (and any UIDs you explicitly list) can talk directly to the network. Everyone else is either forced through TUN (tun2socks) or caught by NAT redirects (transparent). Default is fail-closed.
+
+leaktest command
+
+New module: src/leaktest.rs. New CLI subcommand:
+
+./torvpn leaktest
+
+
+What it does:
+
+DNS leak probe: sends a minimal UDP DNS query to 1.1.1.1:53 and waits up to ~900 ms for a reply. Getting a reply = likely DNS leak (FAIL). No reply = blocked/redirected (PASS).
+
+Tor connectivity: performs a raw SOCKS5 handshake to 127.0.0.1:<SOCKS> and issues an HTTP HEAD / to example.com:80. Success = Tor path is alive (PASS).
+
+Outputs a compact PASS/FAIL summary with notes.
+
+Usage refresher
+
+Build:
+
+cd torvpn
+cargo build --release
+
+
+Run (transparent example):
+
+sudo ./target/release/torvpn --profile profiles/transparent.toml start
+./target/release/torvpn health
+./target/release/torvpn leaktest
+sudo ./target/release/torvpn stop
+
+Notes and next steps
+
+For best isolation, actually run Tor under the tor user so the UID match is meaningful (or set allow_uids=[<tor uid>] if you run a different account). We can also refactor the daemon to setuid to a restricted user post-setup.
+
+Owner matching is applied in the filter/output chain (correct place for meta skuid). NAT redirection is still used for transparent mode, and filter rules allow loopback/Tor localhost ports so redirection can happen while clearnet egress stays limited to the allowed UID set.
+
+The tun2socks mode in the MVP assumes you route traffic into the TUN device. If you want full-box routing in that mode, I can add ip rule/route setup to push default via tun0 and keep clearnet blocked for non-allowed UIDs.
+
+Pick your next bite:
+
+Add route setup for tun2socks mode (policy routing + MSS clamping)
+
+Privilege split: run Tor as tor, daemon as torvpn, drop caps after setup
+
+Expand leaktest with .onion reachability and SOCKS UDP checks
+
+
+
+Done. I added a proper policy routing + MSS clamping path for the Linux tun2socks mode so traffic is cleanly steered into the TUN and behaves under tight MTUs.
+
+Download the updated build:
+torvpn_linux_tun2socks_routing_mss.zip
+
+What’s new
+Routing module (policy + MSS)
+
+New: src/routing.rs
+
+Policy routing:
+
+Creates a dedicated route table 100 with default via 10.111.0.2 dev tun0
+
+Adds ip rule add fwmark 0x1 lookup 100 priority 100
+
+Packet marking + MSS clamp (nft mangle table torvpn_mangle):
+
+m_out (route/output):
+
+Skip loopback
+
+Allow unmarked egress for allowed_uids (e.g., tor user)
+
+Mark everything else meta mark set 0x1 → hits table 100
+
+m_post (route/postrouting):
+
+tcp flags syn tcp option maxseg size set clamp to pmtu
+to avoid MTU blackholes through the tunnel
+
+Teardown: removes the ip rule, flushes table 100, deletes torvpn_mangle
+
+Main flow wiring
+
+On start when [net].mode == "tun2socks":
+
+nftables leak-guard (existing)
+
+TUN create (existing)
+
+Apply routing policy + MSS clamp (new)
+
+Start Tor (existing)
+
+Start tun2socks (existing)
+
+On stop: calls routing::teardown_for_tun2socks() before TUN teardown and nft flush (safe if already gone)
+
+How it fits with per-UID rules
+
+The filter table (from earlier) still:
+
+Allows loopback and Tor localhost ports
+
+Allows oifname "tun0"
+
+Accepts meta skuid @allowed_uids (e.g., Tor’s UID) for direct clearnet egress
+
+Drops stray DNS
+
+The new mangle table:
+
+Marks non-allowed UIDs so policy routes push them into table 100 → default via tun0
+
+Clamps MSS to PMTU for SYNs
+
+Quick run (tun2socks mode)
+sudo ./target/release/torvpn --profile profiles/default.toml start
+./target/release/torvpn leaktest
+./target/release/torvpn health
+sudo ./target/release/torvpn stop
+
+Notes
+
+peer_ip for the TUN is 10.111.0.2, matching the earlier profile. If you customize [tun].cidr, keep it a /30 and ensure tun2socks uses the opposite end.
+
+If you run Tor under a dedicated tor user (recommended), it’s automatically allowed for direct egress. Otherwise, add your chosen UID under [security].allow_uids.
+
+The marking path intentionally exempts loopback traffic and allowed UIDs; everything else gets steered into the tunnel and passes filter because oifname "tun0" is permitted.
+
+Want me to add a LAN bypass option (e.g., allow 192.168.0.0/16 to route locally), or do we go for privilege split (dedicated service user with limited caps) next?
+
+
+
+
+
+Alright, two birds, one precision-guided stone:
+
+“Around-the-world” routing via a proxy list + controllable Tor exits
+
+Sensible, real-world “quantum encryption” = post-quantum (PQC) integration where it actually helps
+
+I’ve shipped cross-platform upgrades (Linux + Windows) that do exactly that.
+
+Downloads:
+
+Linux (proxy rotation + exit policy + PQC):
+torvpn_linux_proxy_exit_pqc.zip
+
+Windows (proxy rotation + exit policy + PQC):
+torvpn_win_proxy_exit_pqc.zip
+
+a) Proxy list “world hop” + double-bounce realities
+What’s implemented (safe + effective)
+
+Pre-Tor upstream proxy support with rotation:
+
+You can feed a list of SOCKS5/HTTPS proxies.
+
+We set Tor’s Socks5Proxy/HTTPSProxy via the ControlPort and send NEWNYM.
+
+Rotation modes: sequential or random.
+
+Exit country preferences:
+
+We set Tor’s ExitNodes={us},{de},... and StrictNodes=1 if you want to prefer/hard-pin exits to specific countries.
+
+You can change this at runtime.
+
+Tor only supports one upstream proxy at a time, not a true multi-hop pre-chain. So I built rotation (hop to the next proxy + new identity) rather than faking an unsafe post-Tor chain. Post-Tor proxies defeat Tor’s anonymity guarantees; I’m not building that in by default. If you insist, I can gate it behind a “you accept the risk” profile flag.
+
+How to use it
+1) Put proxies in your profile
+
+Linux: profiles/default.toml (or any profile) now includes:
+
+[proxy]
+enabled = true
+rotation = "sequential"   # or "random" or "off"
+proxies = [
+  { typ = "socks5", addr = "1.2.3.4:1080" },
+  { typ = "https",  addr = "5.6.7.8:8080", username = "alice", password = "secret" }
+]
+
+[exit]
+countries = ["us","de"]   # optional; e.g., ["se","nl"]
+strict = true
+
+
+Windows has the same blocks in profiles/default_win.toml.
+
+2) Apply policy / hop proxies at runtime
+
+Linux:
+
+./torvpn applypolicy         # apply the profile's proxy + exit settings
+./torvpn proxynext           # rotate to next proxy and NEWNYM
+./torvpn exitset --countries us,de
+./torvpn exitclear
+
+
+Windows:
+
+.\torvpn-win.exe applypolicy
+.\torvpn-win.exe proxynext
+.\torvpn-win.exe exitset --countries us,de
+.\torvpn-win.exe exitclear
+
+3) “Around the world” workflow
+
+Keep a decent list of trusted upstreams (SOCKS5 > HTTPS if you can).
+
+Set rotation="sequential" or random.
+
+Optionally set [exit].countries to bias where your apparent egress is.
+
+Use proxynext whenever you want to hop. NEWNYM fires automatically.
+
+Notes: site geofencing is a legal/ToS gray area. Use responsibly. Exit-pinning can hurt connectivity; StrictNodes=1 may fail in some regions.
+
+b) “Quantum encryption” the right way (PQC, not sci-fi)
+
+You can’t “make Tor quantum” without rewriting Tor. What we can do (and I built):
+
+PQC signatures (Dilithium2) to sign and verify artifacts/config:
+
+Sign your profile.toml, bridge lists, binaries, or updates.
+
+Verify before applying. Prevents tampering and supply-chain surprises.
+
+PQC KEM (Kyber1024) for secret exchange at rest/out-of-band:
+
+E.g., encrypt a private bridges file to a recipient’s PQ public key.
+
+Both projects now include a pqc module and CLI helpers.
+
+PQC CLI
+
+Linux:
+
+# Generate signing keys into ./keys/
+./torvpn pqckeygen --out-dir ./keys
+
+# Sign a file
+./torvpn pqcsign --sk ./keys/pqc_dilithium2.sk --input profiles/transparent.toml --sig-out transparent.toml.sig
+
+# Verify a file+sig
+./torvpn pqcverify --pk ./keys/pqc_dilithium2.pk --input profiles/transparent.toml --sig transparent.toml.sig
+
+# Kyber KEM demo (writes ciphertext + shared secrets)
+./torvpn pqckemdemo --out-dir ./kem_out
+
+
+Windows:
+
+.\torvpn-win.exe pqckeygen --out-dir .\keys
+.\torvpn-win.exe pqcsign --sk .\keys\pqc_dilithium2.sk --input .\profiles\default_win.toml --sig-out .\default_win.toml.sig
+.\torvpn-win.exe pqcverify --pk .\keys\pqc_dilithium2.pk --input .\profiles\default_win.toml --sig .\default_win.toml.sig
+.\torvpn-win.exe pqckemdemo --out-dir .\kem_out
+
+
+Where we use PQC in the stack:
+
+Profile integrity: refuse to apply a profile unless signature verifies (optional policy we can flip on).
+
+Bridge lists / sensitive config: store only as PQC-signed, optionally Kyber-wrapped blobs.
+
+Future: if we add a remote controller/UI, we’ll do hybrid TLS (X25519+Kyber) at that layer.
+
+I also pulled a file inventory for your quantum_encryption bundle so you can eyeball what’s inside. If you want me to wire that exact code in (license permitting), point me to the algorithm you intended; otherwise I’ll stick with standardized PQC (Dilithium/Kyber) we’re already using.
+
+Reality check on “double bounce”
+
+Pre-Tor proxy chain: Tor supports one upstream proxy. We rotate cleanly; multiple chained upstreams are brittle and add little safety.
+
+Post-Tor proxy: bad idea; it turns Tor into “just a fancy middle hop” and hands your traffic to a third party exit you chose. Not enabled by default. If you want it anyway for a controlled lab scenario, I’ll gate it behind an explicit, off-by-default profile flag with warnings.
+
+Recap of what you’ve now got
+
+Linux:
+
+Proxy rotation + ExitNodes control (CLI + profile)
+
+PQC keygen/sign/verify/KEM utilities
+
+All the previous: transparent mode, tun2socks policy routing + MSS clamp, per-UID nftables, leaktest, Tor control, systemd daemon
+
+Windows:
+
+Proxy rotation + ExitNodes control (CLI + profile)
+
+PQC utilities
+
+All the previous: NRPT DNS lock, firewall kill-switch, Tor control CLI, native Windows Service with auto-recovery
+
+If you want, next I can:
+
+Enforce “profile must verify” policy and embed the verifier into startup, with a trust-on-first-use store.
+
+Add an optional bridge vault (Kyber-wrapped, Dilithium-signed) with CLI to add/remove bridges safely.
+
+Add a hop plan: scheduled country/proxy hops on a cadence.
+
+Tell me where you want the next bolt tightened.
+
 
 
 
