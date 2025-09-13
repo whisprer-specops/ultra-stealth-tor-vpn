@@ -1630,4 +1630,674 @@ Tell me where you want the next bolt tightened.
 
 
 
+Hop plan: done and wired into both platforms. You can now schedule country + proxy hops on a cadence; the daemon/service applies them automatically and rotates circuits.
+
+Downloads:
+
+Linux: torvpn_linux_with_hop_plan.zip
+
+Windows: torvpn_win_with_hop_plan.zip
+
+How it works
+New config section
+
+In both Linux and Windows profiles you’ll see:
+
+[hop]
+enabled = false          # flip to true to start hopping
+randomize = false        # (placeholder for future shuffle)
+loop_forever = true      # cycle continuously
+jitter = "0s"            # optional max random jitter per hop (e.g., "30s")
+
+[[hop.sequence]]
+duration = "20m"
+exit_countries = ["us"]
+proxy = "next"           # use the next proxy from your [proxy] list
+
+[[hop.sequence]]
+duration = "15m"
+exit_countries = ["de"]
+proxy = "socks5://203.0.113.42:1080"  # explicitly set a proxy for this hop
+
+
+duration: parsed with humantime (“15m”, “1h”, etc.).
+
+exit_countries: Tor ExitNodes gets set to {us}, {de}, etc., and StrictNodes=1 for the hop.
+
+proxy:
+
+"next" → rotates to the next entry in your [proxy].proxies list, then sends NEWNYM.
+
+"socks5://host:port" or "https://host:port" → sets that directly for the hop.
+
+null/omitted → leave current proxy as-is.
+
+Optional jitter adds up to that much random delay on top of each hop duration to avoid clock-like patterns.
+
+Scheduler behavior
+
+State is kept in hop_state.json under the app’s state dir, so it survives restarts.
+
+On each health tick (every ~10s), the daemon/service checks if the hop’s next_epoch_ms has passed; if so, it:
+
+Applies ExitNodes/StrictNodes
+
+Applies the proxy change (rotate or explicit)
+
+Signals NEWNYM
+
+Schedules the next hop (duration + optional jitter)
+
+Where it runs
+
+Linux: in our daemon mode (torvpn daemon) and the systemd unit you already have installed.
+
+Windows: in the native service loop (Service name: TorVPN).
+
+Quick start
+
+Edit your profile:
+
+Linux: profiles/transparent.toml or profiles/default.toml
+
+Windows: profiles/default_win.toml or profiles/obfs4_win.toml
+Set:
+
+[hop]
+enabled = true
+loop_forever = true
+jitter = "20s"
+
+
+and define your [[hop.sequence]] entries.
+
+Start the long-runner:
+
+Linux (systemd): sudo systemctl restart torvpn
+
+Linux (manual): sudo ./torvpn --profile profiles/transparent.toml daemon
+
+Windows (service): sc.exe stop TorVPN && sc.exe start TorVPN
+
+Windows (manual): .\torvpn-win.exe ServiceInstall (once), then sc.exe start TorVPN
+
+Watch it work:
+
+Linux: journalctl -fu torvpn
+
+Windows: Event Viewer -> Windows Logs -> Application, or Get-Service TorVPN
+
+Notes / guardrails
+
+Tor only supports one upstream proxy at a time. The hop plan respects that, changing the upstream per hop and rotating circuits.
+
+Exit pinning (StrictNodes=1 with tight country sets) can reduce path availability. If a hop fails to build circuits, the daemon will detect control health degradation and recycle components like before.
+
+If you’re using obfs4/bridges, the hop plan still applies to ExitNodes/proxy settings; just make sure your obfs4 bridge transport is configured in the profile.
+
+Extras you might want next
+
+Shuffle the hop order per cycle (randomize=true + Fisher–Yates on sequence).
+
+Calendar windows (e.g., “weekdays: us->de rotation; weekends: se->ch”).
+
+Per-hop DNS exceptions for local LAN domains in transparent mode.
+
+Export a JSON status endpoint with current hop, time remaining, and resolved exit IP.
+
+Call the shot and I’ll wire it in. 
+
+
+
+Cranked it up a notch. You’ve now got:
+
+Shuffle per cycle: set randomize = true and the hop sequence is Fisher–Yates shuffled at the start of each cycle. Persisted in state so it stays stable until the next cycle.
+
+JSON status endpoint: a tiny local HTTP server that reports current hop, time remaining, and the live Tor exit IP.
+
+Downloads:
+
+Linux: torvpn_linux_hop_random_status.zip
+
+Windows: torvpn_win_hop_random_status.zip
+
+How to use it
+1) Shuffle hop order
+
+In your profile ([hop] block):
+
+[hop]
+enabled = true
+randomize = true        # shuffle order once per cycle
+loop_forever = true
+jitter = "30s"
+
+
+The scheduler stores an order vector in hop_state.json.
+
+It regenerates a new order when a new cycle starts, or if you toggle randomize or change sequence length.
+
+2) JSON status endpoint
+
+New profile block:
+
+[status]
+enabled = true
+listen = "127.0.0.1:8787"
+
+
+Serves GET /status (local only) with a JSON snapshot:
+
+{
+  "current_index": 1,
+  "total": 4,
+  "seconds_remaining": 732,
+  "next_epoch_ms": 1726234567890,
+  "current_hop": {
+    "duration": "20m",
+    "exit_countries": ["de"],
+    "proxy": "next"
+  },
+  "tor": {"socks_port":9050,"dns_port":5353,"control_port":9051},
+  "exit_ip": "185.220.101.7",
+  "mode": "transparent" // Linux only field
+}
+
+
+Exit IP is resolved by making an HTTP request to api.ipify.org through Tor’s SOCKS (raw SOCKS5 connect + GET). If it can’t fetch, exit_ip is null.
+
+Where it runs
+
+Linux: started automatically in daemon mode (and by the systemd unit).
+
+Windows: started inside the Windows Service loop.
+
+It’s light: single-threaded tokio listener, local-only by default.
+
+Notes, gotchas, knobs
+
+The “current hop” in /status reflects the hop at idx from the persisted order. If you change the [[hop.sequence]] in the profile while running, the next cycle rebuilds the order; until then, it continues with the existing order.
+
+If randomize=false, the order is the identity [0..n-1] every cycle.
+
+jitter adds up to that much random time to each hop; keep it within sensible ranges so your cadence doesn’t look robotic.
+
+If you’re in transparent mode, the exit IP fetch still goes via Tor (system traffic is forced through Tor). If you’re in tun2socks mode, the fetch goes via SOCKS explicitly.
+
+Quick test checklist
+
+Linux:
+
+sudo systemctl restart torvpn
+curl -s http://127.0.0.1:8787/status | jq
+./torvpn proxynext
+./torvpn health
+
+
+Windows (Admin PowerShell):
+
+sc.exe stop TorVPN; sc.exe start TorVPN
+Invoke-RestMethod http://127.0.0.1:8787/status | ConvertTo-Json
+.\torvpn-win.exe proxynext
+.\torvpn-win.exe health
+
+Want more?
+
+Add /status/metrics with rolling hop history, avg hop duration, last few exit IPs.
+
+Add /control/newnym endpoint (CSRF-protected token) for quick hops without the CLI.
+
+Prometheus scrape output if you’re feeling opsy.
+
+Your move, captain.
+
+
+
+Hotkey hop is live.
+
+I added a local HTTP control endpoint to both builds, with a CSRF-style token check and a cooldown so you can pop a NEWNYM without touching the CLI.
+
+Downloads:
+
+Linux: torvpn_linux_control_endpoint.zip
+
+Windows: torvpn_win_control_endpoint.zip
+
+What you get
+
+POST /control/newnym — rotates circuits via Tor ControlPort
+
+Protected by a per-host token (generated on first run and stored in the app state dir)
+
+10-second cooldown enforced to respect Tor’s NEWNYM pacing
+
+Still serves GET /status with the live exit IP, current hop, and time remaining
+
+Where the token lives
+
+Linux: ~/.local/share/torvpn/api_token
+
+Windows: %LOCALAPPDATA%\torvpn\api_token
+
+Example calls
+
+Linux:
+
+TOK=$(cat ~/.local/share/torvpn/api_token)
+curl -s -X POST http://127.0.0.1:8787/control/newnym \
+  -H "X-TorVPN-Token: $TOK"
+
+
+Windows (PowerShell):
+
+$tok = Get-Content "$env:LOCALAPPDATA\torvpn\api_token"
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/control/newnym `
+  -Headers @{ "X-TorVPN-Token" = $tok }
+
+
+Response:
+
+{"ok":true,"newnym_sent":true,"cooldown_remaining":0}
+
+
+If you spam it inside 10 seconds:
+
+{"ok":true,"newnym_sent":false,"cooldown_remaining":7}
+
+Notes
+
+Endpoint is local-only by default (listen = "127.0.0.1:8787"). Don’t bind it to 0.0.0.0 unless you really mean it.
+
+You can also send the token in Authorization: Bearer <token> if that’s handier for your tooling.
+
+Hook this into your hop automations, keyboards, or a status bar and punch it on demand.
+
+Want me to add /control/exitset?cc=us,de and /control/proxynext with the same token guard, or should we layer in a /metrics scrape for Prometheus next?
+
+
+
+
+$tok = Get-Content "$env:LOCALAPPDATA\torvpn\api_token"
+
+NEWNYM
+
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/control/newnym
+ -Headers @{ "X-TorVPN-Token" = $tok }
+
+Proxy rotate
+
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/control/proxynext
+ -Headers @{ "X-TorVPN-Token" = $tok }
+
+Set exits (comma-separated cc) or clear with cc=
+
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/control/exitset?cc=us,de
+" -Headers @{ "X-TorVPN-Token" = $tok }
+
+Always show details
+'''
+        (root / "README.md").write_text(readme)
+
+    # Zip
+    zip_path = Path("/mnt/data/torvpn_win_control_extras.zip")
+    if zip_path.exists(): zip_path.unlink()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in root.rglob("*"):
+            zf.write(path, path.relative_to(root))
+    return zip_path.as_posix()
+
+linux_zip = patch_status_server_linux()
+win_zip = patch_status_server_windows()
+(linux_zip, win_zip)
+
+Result
+('/mnt/data/torvpn_linux_control_extras.zip',
+ '/mnt/data/torvpn_win_control_extras.zip')
+
+Buttoned up.
+
+I added two token-guarded control endpoints to both builds:
+
+POST /control/proxynext — rotate to the next upstream proxy (from your [proxy].proxies), persist index, then send NEWNYM.
+
+POST /control/exitset?cc=us,de — set Tor ExitNodes={us},{de} and StrictNodes=1 (or clear with cc=), then send NEWNYM.
+
+Downloads:
+
+Linux: torvpn_linux_control_extras.zip
+
+Windows: torvpn_win_control_extras.zip
+
+How to use
+Token
+
+Linux: ~/.local/share/torvpn/api_token
+
+Windows: %LOCALAPPDATA%\torvpn\api_token
+
+Examples
+
+Linux:
+
+TOK=$(cat ~/.local/share/torvpn/api_token)
+
+# Rotate proxy + NEWNYM
+curl -s -X POST "http://127.0.0.1:8787/control/proxynext" \
+  -H "X-TorVPN-Token: $TOK"
+
+# Set exits (US, DE) + NEWNYM
+curl -s -X POST "http://127.0.0.1:8787/control/exitset?cc=us,de" \
+  -H "X-TorVPN-Token: $TOK"
+
+# Clear exits (back to default)
+curl -s -X POST "http://127.0.0.1:8787/control/exitset?cc=" \
+  -H "X-TorVPN-Token: $TOK"
+
+
+Windows (PowerShell):
+
+$tok = Get-Content "$env:LOCALAPPDATA\torvpn\api_token"
+
+# Rotate proxy + NEWNYM
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/control/proxynext -Headers @{ "X-TorVPN-Token" = $tok }
+
+# Set exits (US, DE) + NEWNYM
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/control/exitset?cc=us,de" -Headers @{ "X-TorVPN-Token" = $tok }
+
+# Clear
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/control/exitset?cc=" -Headers @{ "X-TorVPN-Token" = $tok }
+
+Under the hood
+
+Same token guard as /control/newnym (accepts X-TorVPN-Token or Authorization: Bearer).
+
+Same 10s NEWNYM cooldown applies only to /control/newnym; proxynext and exitset send NEWNYM immediately after applying settings.
+
+proxynext persists rotation index in proxy_idx.json under the state dir.
+
+exitset accepts comma-separated ISO 2-letter country codes; it wraps each as {cc} and flips StrictNodes on. Empty cc clears.
+
+Nice-to-haves we can add
+
+/control/exitclear as a shortcut alias
+
+/status/plan showing the randomized hop order and next hop ETA
+
+Rate limiting (per-IP / per-token) and HMAC’d tokens if you ever bind the status server beyond loopback
+
+What’s next, captain?
+
+
+
+Absolutely minted.
+
+I added the “nice-to-haves” across both builds:
+
+POST /control/exitclear — clears ExitNodes/StrictNodes and sends NEWNYM
+
+GET /status/plan — shows hop plan state (randomized order, current index, ETA, upcoming hops)
+
+Basic rate limiting when bound beyond loopback (5 req/sec, 120/min per IP → 429)
+
+Optional HMAC auth header for remote binds
+
+Downloads:
+
+Linux: torvpn_linux_control_plus_statusplan.zip
+
+Windows: torvpn_win_control_plus_statusplan.zip
+
+New endpoints
+Control (token or Bearer auth required)
+
+POST /control/proxynext — rotate upstream proxy + NEWNYM
+
+POST /control/exitset?cc=us,de — set ExitNodes ({us},{de}) + StrictNodes=1 + NEWNYM
+
+POST /control/exitclear — clear exit prefs + NEWNYM
+
+Status
+
+GET /status — current hop snapshot + resolved exit IP (via Tor SOCKS)
+
+GET /status/plan — hop plan internals:
+
+{
+  "randomized": true,
+  "order_indices": [2,0,1,3],
+  "current_index_in_order": 1,
+  "seconds_remaining": 713,
+  "total": 4,
+  "upcoming": [
+    {"index":0,"duration":"20m","exit_countries":["us"],"proxy":"next"},
+    {"index":1,"duration":"15m","exit_countries":["de"],"proxy":"socks5://203.0.113.42:1080"},
+    {"index":3,"duration":"10m","exit_countries":["se"],"proxy":null}
+  ]
+}
+
+Auth
+
+Token (always accepted):
+
+Linux: ~/.local/share/torvpn/api_token
+
+Windows: %LOCALAPPDATA%\torvpn\api_token
+
+curl -s -X POST http://127.0.0.1:8787/control/exitclear \
+  -H "X-TorVPN-Token: $(cat ~/.local/share/torvpn/api_token)"
+
+
+Optional HMAC (recommended if you bind beyond loopback):
+
+Header: X-TorVPN-HMAC: <ts>:<hex(hmac_sha256(secret, ts|method|path))>
+
+Secret file (auto-generated): api_hmac_secret in the same state dir.
+
+Accepts ±300s clock skew.
+
+Example (bash/openssl):
+
+TS=$(date +%s)
+MSG="$TS|POST|/control/proxynext"
+HEX=$(printf "%s" "$MSG" | openssl dgst -sha256 -mac HMAC -macopt hexkey:$(xxd -p -c 256 ~/.local/share/torvpn/api_hmac_secret | tr -d '\n') | awk '{print $2}')
+curl -s -X POST http://0.0.0.0:8787/control/proxynext \
+  -H "X-TorVPN-HMAC: $TS:$HEX"
+
+Rate limiting
+
+If listen ≠ 127.0.0.1:*, a simple per-IP limiter kicks in:
+
+Burst: 5 req/sec
+
+Rolling window: 120 req/min
+
+On overflow: HTTP 429
+
+Quick checks
+
+Linux:
+
+# Plan view
+curl -s http://127.0.0.1:8787/status/plan | jq
+
+# Exit clear
+TOK=$(cat ~/.local/share/torvpn/api_token)
+curl -s -X POST http://127.0.0.1:8787/control/exitclear -H "X-TorVPN-Token: $TOK"
+
+
+Windows (PowerShell):
+
+Invoke-RestMethod http://127.0.0.1:8787/status/plan | ConvertTo-Json
+$tok = Get-Content "$env:LOCALAPPDATA\torvpn\api_token"
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/control/exitclear -Headers @{ "X-TorVPN-Token" = $tok }
+
+
+Alright, fren—let’s zoom out for a sanity sweep next like you suggested. I’ll lay out an aerial map: threat model, traffic flows (transparent vs tun2socks), privilege boundaries, cap sets, fail-closed guarantees, control/telemetry surfaces, and where PQC actually hardens things. Then we can spot any gaps or “this is clever but unnecessary” bits to trim. Sound good?
+
+
+
+
+##############
+#
+##############
+
+
+Thought for 31s
+
+Got it. Here’s the straight-up status report you asked for.
+
+i) Not yet included (or only partially done)
+Security / hardening
+
+Privilege split + least-priv on Linux: create a dedicated torvpn user, do setup as root, then drop caps (keep only NET_ADMIN) and chroot/seccomp where possible. We called this out as a next step but didn’t wire it yet. 
+Privilege split on Windows: service currently runs as LocalSystem; move to a restricted service account and tighten WFP rules to that SID. 
+
+
+Enforce PQC signature checks at startup (TOFU store): we added Dilithium/Kyber tools but enforcement is optional; make “profile must verify” a hard gate. 
+TLS for the local HTTP status/control server (it’s HTTP with Token/HMAC today). Option: loopback-only default (keep), plus opt-in TLS for remote binds. (
+
+Rate limit exists; add per-token quotas and structured audit logs for control calls. 
+
+Network coverage / leaks
+IPv6: explicitly route/deny IPv6 in nftables + Windows Firewall/NRPT. We talked IPv4 paths; v6 rules are not spelled out yet. 
+
+Transparent mode UDP: Tor can’t carry general UDP; we document “use tun2socks for UDP,” but no auto-fallback from transparent→tun2socks for UDP-heavy apps yet. 
+WebRTC STUN/ICE hardening: add default denies for common STUN ports to avoid browser side-steps (Windows + Linux). 
+
+LAN bypass knobs (CIDR allowlist) were proposed but not implemented; add per-profile LAN exceptions safely. 
+
+Bridges / transports
+Bridges/obfs4 supported via profiles, but no bridge vault (Kyber-wrapped, Dilithium-signed) and no auto-fetch/rotation UX yet. 
+
+
+Routing / policy
+Windows: no MSS clamp or policy-routing equivalent (Linux has MSS clamp + fwmark table). Add PMTU-safe config for Wintun. 
+Per-app include/exclude on Windows via WFP filters/AppContainer rules isn’t in yet. 
+
+
+Ops / UX
+Prometheus /metrics endpoint and hop history were suggested but not shipped. 
+
+Installer packaging (MSI, DEB/RPM) and bundling known-good tun2socks/wintun; we noted it as a follow-up. 
+Reproducible builds, SBOM, CI, and code-signing (Authenticode on Win) not set up yet. PQC covers config, not( binaries. 
+
+MacOS support not tackled. 
+
+Docs: a formal threat model and “what this does/doesn’t protect” page would help new users. 
+
+
+###############
+#
+###############
+
+
+ii) What’s in place now (with quick details)
+
+Cross-platform core
+
+Tor control: NEWNYM, circuit list, health, and SETCONF helpers, exposed via CLI. Works in both tun2socks and transparent modes. 
+
+petey
+
+Profiles & templated torrc with SOCKS/DNS/Control (and TransPort on Linux transparent). 
+
+petey
+
+Pre-Tor proxy list & rotation: SOCKS5/HTTPS upstreams, sequential/random rotation, plus proxynext route + NEWNYM. 
+
+petey
+
+Exit policy control: exitset/exitclear, country pinning via ExitNodes + StrictNodes. 
+
+petey
+
+Hop plan scheduler: timed hops with per-hop proxy and exit sets, optional jitter, and cycle randomize (Fisher–Yates). State persists across restarts. 
+
+petey
+
+Local HTTP API:
+
+GET /status (live exit IP via Tor SOCKS, current hop, ETA)
+
+GET /status/plan (order, upcoming hops)
+
+POST /control/newnym (cooldown-guarded), POST /control/proxynext, POST /control/exitset, POST /control/exitclear
+
+Auth: per-host token, optional HMAC for remote binds, plus rate limiting for non-loopback binds. 
+
+petey
+
+PQC utilities: Dilithium2 signing (keygen/sign/verify) and Kyber1024 KEM demo; intended for profile/bridge-list integrity and future update channels. 
+
+petey
+
+Linux
+
+Two modes:
+
+tun2socks: TUN → tun2socks → Tor SOCKS (TCP+UDP via SOCKS)
+
+transparent: nft redirection to Tor TransPort/DNSPort, no TUN/tun2socks. 
+
+petey
+
+Fail-closed nftables: leak guard (drop DNS leaks, allow loopback and Tor ports), plus per-UID allowlist so only Tor’s UID can egress clearnet directly. 
+
+petey
+
+Policy routing + MSS clamp for tun2socks: fwmark → table 100, PMTU clamp for SYN to avoid blackholes. 
+
+petey
+
+Leaktest CLI: DNS leak probe + Tor SOCKS handshake/HTTP test with PASS/FAIL output. 
+
+petey
+
+Systemd unit: sandboxing, auto-restart, and long-running daemon with control-health watchdog + automatic recovery. 
+
+petey
+
+Windows
+
+Wintun + tun2socks start/stop with generated torrc; status/stop via CLI. 
+
+petey
+
+Firewall kill-switch: allow Tor + Wintun adapter, block everything else. 
+
+petey
+
+DNS lock: NRPT rule for “.” to 127.0.0.1, adapter DNS set to loopback, and firewall blocks on TCP/UDP 53 except loopback/Tor DNSPort. 
+
+petey
+
+Native Windows Service: auto-recovery, mirrors daemon logic; Tor control CLI available even alongside the service. 
+
+petey
+
+Same HTTP status/control API (token/HMAC/rate limit) as Linux. 
+
+petey
+
+If you want me to start knocking down the “missing” list, I’d hit these in order:
+
+Linux/Windows privilege split + cap drop/service user
+
+IPv6 handling end-to-end (nftables + WFP/NRPT)
+
+Enforce PQC-signed profiles at startup (with TOFU)
+
+Bridge vault + simple CLI UX
+
+/metrics and structured logs (Prometheus-friendly)
+
+Say the word and I’ll ship those next.
+
+
+
+###############
+#
+###############
+
+
 
