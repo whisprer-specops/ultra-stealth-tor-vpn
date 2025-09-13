@@ -1,0 +1,12 @@
+# Identify Wintun adapter
+$adapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Wintun*" }
+
+# Block all outbound by default (create a custom policy group)
+New-NetFirewallRule -DisplayName "TORVPN Block All" -Direction Outbound -Action Block -Enabled True
+
+# Allow Tor process
+$tor = "C:\Program Files\Tor\tor.exe"
+New-NetFirewallRule -DisplayName "TORVPN Allow Tor" -Program $tor -Direction Outbound -Action Allow -Enabled True
+
+# Allow traffic bound to the Wintun interface
+New-NetFirewallRule -DisplayName "TORVPN Allow Wintun" -InterfaceAlias $adapter.Name -Direction Outbound -Action Allow -Enabled True

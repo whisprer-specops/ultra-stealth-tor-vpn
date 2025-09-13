@@ -1,0 +1,5 @@
+UseBridges 1
+ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+# Bridges managed externally by profile_manager; examples:
+Bridge obfs4 <FPR> <IP>:<PORT> cert=<CERT> iat-mode=0
+Bridge obfs4 <FPR2> <IP2>:<PORT2> cert=<CERT2> iat-mode=0

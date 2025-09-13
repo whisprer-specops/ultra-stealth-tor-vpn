@@ -1,0 +1,27 @@
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet torvpn {
+  sets {
+    allowed_local { type ipv4_addr; elements = { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } }
+  }
+  chains {
+    output {
+      type filter hook output priority 0; policy drop;
+      # allow loopback
+      ip daddr 127.0.0.0/8 accept
+      # allow Tor daemon traffic (match by uid/gid we run Tor under)
+      meta skuid tor accept
+      meta skgid tor accept
+      # allow traffic via TUN device
+      oifname "tun0" accept
+    }
+    prerouting {
+      type nat hook prerouting priority -100;
+      # redirect TCP (not local or tor itself) to TransPort
+      ip saddr != @allowed_local tcp redirect to :9040
+      # DNS to Tor DNSPort
+      udp dport 53 redirect to :5353
+    }
+  }
+}

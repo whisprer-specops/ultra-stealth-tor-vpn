@@ -1,0 +1,17 @@
+ClientOnly 1
+SOCKSPort 127.0.0.1:9050
+DNSPort 127.0.0.1:5353
+AutomapHostsOnResolve 1
+AutomapHostsSuffixes .onion,.exit
+ClientUseIPv4 1
+ClientUseIPv6 1
+SafeSocks 1
+UseGuardFraction 1
+CircuitPadding 1
+AvoidDiskWrites 1
+GeoIPFile ""
+GeoIPv6File ""
+
+# ControlPort for our daemon (random cookie auth file managed by tor_manager)
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
